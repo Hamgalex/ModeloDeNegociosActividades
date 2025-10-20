@@ -4,8 +4,7 @@
 suppressPackageStartupMessages({
   library(tidyverse)
   library(forecast)
-  library(zoo)   # yearmon
-  library(readr) # parse_number
+  library(zoo)   # as.yearmon
 })
 
 # ============================
@@ -16,6 +15,7 @@ setwd("C:/Users/hamga/Documents/repo/ModeloDeNegociosActividades/hierarchy/datas
 archivos <- c("banamex.csv", "banorte.csv", "BBVA.csv", "hsbc.csv", "santander.csv")
 bancos   <- c("Banamex", "Banorte", "BBVA", "HSBC", "Santander")
 
+# Columnas esperadas
 esperadas <- c("Periodo",
                "credito_comercial",
                "credito_vivienda",
@@ -24,34 +24,31 @@ esperadas <- c("Periodo",
                "banco",
                "efectivo")
 
-leer_y_limpia <- function(path, nombre_banco){
+leer_archivo <- function(path, nombre_banco){
   df <- read.csv(path, check.names = FALSE, stringsAsFactors = FALSE)
   faltan <- setdiff(esperadas, names(df))
   if (length(faltan) > 0) {
     stop(sprintf("En '%s' faltan columnas: %s", path, paste(faltan, collapse=", ")))
   }
   df <- df[, esperadas]
-  num_cols <- setdiff(esperadas, "Periodo")
-  df[num_cols] <- lapply(df[num_cols], readr::parse_number)
-  df$Periodo <- as.character(df$Periodo)
-  df$Periodo <- as.Date(paste0(df$Periodo, "01"), format = "%Y%m%d")
+  df$Periodo <- as.Date(paste0(as.character(df$Periodo), "01"), format = "%Y%m%d")
   df$Banco <- nombre_banco
   df
 }
 
 lista <- lapply(seq_along(archivos), function(i){
-  leer_y_limpia(archivos[i], bancos[i])
+  leer_archivo(archivos[i], bancos[i])
 })
 
 df <- bind_rows(lista) %>%
   arrange(Periodo, Banco)
 
 # ============================
-# 3) Formato ancho - hojas
+# 3) Hojas (bottom level)
 # ============================
 df_long <- df %>%
   pivot_longer(
-    cols = c(credito_com, credito_vivie, caja, banco),
+    cols = c(credito_comercial, credito_vivienda, caja, banco),
     names_to = "Categoria", values_to = "Valor"
   )
 
@@ -60,17 +57,16 @@ df_wide <- df_long %>%
   pivot_wider(names_from = Leaf, values_from = Valor)
 
 leaf_order <- as.vector(t(outer(bancos,
-                                c("credito_com","credito_vivie","caja","banco"),
+                                c("credito_comercial","credito_vivienda","caja","banco"),
                                 paste, sep="_")))
 leaf_cols <- intersect(leaf_order, names(df_wide))
 if (length(leaf_cols) != length(leaf_order)) {
   faltan_leaf <- setdiff(leaf_order, leaf_cols)
-  warning(sprintf("Faltan hojas esperadas: %s",
-                  paste(faltan_leaf, collapse = ", ")))
+  warning(sprintf("Faltan hojas esperadas: %s", paste(faltan_leaf, collapse = ", ")))
 }
 
 # ============================
-# 3.1) Normalizar calendario mensual
+# 3.1) Calendario mensual completo
 # ============================
 df_wide <- df_wide %>%
   mutate(PeriodoYM = as.yearmon(Periodo)) %>%
@@ -81,9 +77,7 @@ ym_seq <- seq(from = min(df_wide$PeriodoYM),
               to   = max(df_wide$PeriodoYM),
               by   = 1/12)
 
-cal_full <- tibble(PeriodoYM = ym_seq)
-
-df_wide_full <- cal_full %>%
+df_wide_full <- tibble(PeriodoYM = ym_seq) %>%
   left_join(df_wide, by = "PeriodoYM") %>%
   arrange(PeriodoYM)
 
@@ -106,7 +100,7 @@ ts_base <- ts(df_wide_full %>% select(all_of(leaf_cols)) %>% as.matrix(),
               frequency = 12, start = c(start_year, start_month))
 
 # ============================
-# 5) Matriz S (Total, Totales por banco, Cartera/Efectivo por banco, Hojas)
+# 5) Matriz S
 # ============================
 n_bancos <- length(bancos)
 n_hojas_por_banco <- 4
@@ -125,60 +119,71 @@ S <- matrix(0, nrow = m, ncol = n)
 row <- 1
 # (1) Total
 S[row, ] <- 1; row <- row + 1
+
 # (2) Total por banco
-for(i in 1:n_bancos){ S[row, idx_bank(i)] <- 1; row <- row + 1 }
-# (3) Cartera = credito_com + credito_vivie
 for(i in 1:n_bancos){
-  idx <- idx_bank(i); S[row, idx[1]] <- 1; S[row, idx[2]] <- 1; row <- row + 1
+  S[row, idx_bank(i)] <- 1; row <- row + 1
 }
+
+# (3) Cartera = comercial + vivienda
+for(i in 1:n_bancos){
+  idx <- idx_bank(i)
+  S[row, idx[1]] <- 1
+  S[row, idx[2]] <- 1
+  row <- row + 1
+}
+
 # (4) Efectivo = caja + banco
 for(i in 1:n_bancos){
-  idx <- idx_bank(i); S[row, idx[3]] <- 1; S[row, idx[4]] <- 1; row <- row + 1
+  idx <- idx_bank(i)
+  S[row, idx[3]] <- 1
+  S[row, idx[4]] <- 1
+  row <- row + 1
 }
-# (5) Hojas (identidad)
+
+# (5) Hojas
 S[row:(row+n_bottom-1), ] <- diag(n_bottom)
 
 row_names <- c(
   "Total",
   paste0(bancos, "_Total"),
-  paste0(bancos, "_cartera_de_c"),
+  paste0(bancos, "_cartera_de_creditos"),
   paste0(bancos, "_efectivo"),
   leaf_cols
 )
 col_names <- leaf_cols
 dimnames(S) <- list(row_names, col_names)
 
-if (qr(t(S) %*% S)$rank < n) stop("S'S no es invertible.")
+if (qr(t(S) %*% S)$rank < n) stop("S'S no es invertible (faltan hojas independientes).")
 
 # ============================
-# 6) Series agregadas históricas
+# 6) Series agregadas
 # ============================
 Bmat <- as.matrix(ts_base)
 Ymat <- Bmat %*% t(S)
 colnames(Ymat) <- row_names
-
 make_ts <- function(x) ts(x, start = c(start_year, start_month), frequency = 12)
 
 # ============================
-# 7) Pronósticos (h = 30)
+# 7) Pronósticos SARIMA (h = 30)
 # ============================
 h <- 30
 fit_arima <- function(x){
   auto.arima(x,
-             seasonal   = TRUE,
-             D          = NA,
-             stepwise   = FALSE,
-             approximation = FALSE)
+             D=1)
 }
 
+# Hojas
 fc_leaf <- lapply(1:ncol(ts_base), function(j){
   fit <- fit_arima(ts_base[, j])
   forecast(fit, h = h)
 })
+
 F_leaf <- sapply(fc_leaf, function(x) as.numeric(x$mean))
 F_leaf <- t(F_leaf)
 rownames(F_leaf) <- col_names
 
+# Todas las series
 fc_all <- lapply(1:ncol(Ymat), function(j){
   fit <- fit_arima(make_ts(Ymat[, j]))
   forecast(fit, h = h)
@@ -208,7 +213,7 @@ colnames(Yhat_BU)  <- future_cols
 colnames(Yhat_OLS) <- future_cols
 
 # ============================
-# 10) Dataframes exportables
+# 10) Exportables
 # ============================
 df_S    <- data.frame(Serie = row_names, S, check.names = FALSE)
 df_BU   <- data.frame(Serie = rownames(Yhat_BU),  as.data.frame(Yhat_BU),  check.names = FALSE)
@@ -223,7 +228,7 @@ write.csv(df_leaf, "pronostico_tradicional_hojas.csv",  row.names = FALSE)
 write.csv(df_allf, "pronostico_tradicional_todos.csv",  row.names = FALSE)
 
 # ============================
-# 12) Comparación visual rápida
+# 11) Comparación gráfica
 # ============================
 plot(as.numeric(F_all["Total",]), type="l", lwd=2, col="darkgreen",
      main="Total: Tradicional vs Bottom-Up vs OLS (30 meses)",
@@ -236,7 +241,7 @@ legend("topleft",
        col=c("darkgreen","steelblue","tomato"), lwd=2, bty="n")
 
 # ============================
-# 13) CSV combinado para Power BI
+# 12) CSV para Power BI
 # ============================
 trad <- read.csv("pronostico_tradicional_hojas.csv", check.names = FALSE)
 bu   <- read.csv("pronostico_reconciliado_BU.csv",   check.names = FALSE)
@@ -263,8 +268,8 @@ df_long <- df_long %>%
     Categoria = ifelse(Serie == "Total", "Total", Categoria),
     Nivel = case_when(
       Serie == "Total" ~ "Total",
-      !is.na(Banco) & Categoria %in% c("cartera_de_c","efectivo") ~ "Intermedio",
-      !is.na(Banco) & Categoria %in% c("credito_com","credito_vivie","caja","banco") ~ "Hoja",
+      !is.na(Banco) & Categoria %in% c("cartera_de_creditos","efectivo") ~ "Intermedio",
+      !is.na(Banco) & Categoria %in% c("credito_comercial","credito_vivienda","caja","banco") ~ "Hoja",
       grepl("_Total$", Serie) ~ "Intermedio",
       TRUE ~ "Otro"
     )
